@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""slotctl -- drive slotmeta supervisors from the submit host.
+
+A slot is an allocation whose payload is a supervisor loop polling a control
+directory on shared storage, instead of one fixed workload. Swapping what runs is
+then a file write rather than a re-queue -- which matters when the queue for the
+resource is measured in hours.
+
+    slotctl list
+    slotctl run   <slot> <script> [args...] [--label L] [--port P] [--env K=V]
+    slotctl swap  <slot> <script> [args...]      # same as run; reads as intent
+    slotctl idle  <slot>                          # stop the task, KEEP the slot
+    slotctl drain <slot>                          # release after the current task
+    slotctl stop  <slot>                          # stop the task and release now
+    slotctl abort <slot>                          # release immediately, skip the queue
+    slotctl status <slot> | log <slot> [-f] | queue <slot> | history <slot>
+
+`--queue` on `run` pre-queues for a slot that has not started yet, so the task
+begins on the supervisor's first poll instead of waiting for a human to notice.
+
+The control directory is the only channel: no daemon, no ssh, no socket. Set
+SLOT_ROOT to a path both the submit host and the compute node can see.
+"""
+import argparse
+import json
+import os
+import pathlib
+import shlex
+import subprocess
+import sys
+import time
+
+ROOT = pathlib.Path(os.environ.get("SLOT_ROOT", "")).expanduser()
+HERE = pathlib.Path(__file__).resolve().parent
+
+
+def need_root():
+    if not str(ROOT) or str(ROOT) == ".":
+        sys.exit("SLOT_ROOT is not set. Point it at a directory both the submit host "
+                 "and the compute node can see.")
+    return ROOT
+
+
+def slot_dir(name):
+    d = need_root() / name
+    if not d.is_dir():
+        sys.exit(f"no such slot: {name}  (looked in {d})")
+    return d
+
+
+def read_json(p, default=None):
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return default
+
+
+def fmt_dur(s):
+    try:
+        s = int(s)
+    except Exception:
+        return "?"
+    if s < 0:
+        return "expired"
+    h, r = divmod(s, 3600)
+    m, sec = divmod(r, 60)
+    return f"{h}h{m:02d}m" if h else (f"{m}m{sec:02d}s" if m else f"{sec}s")
+
+
+def alive(state):
+    """The supervisor rewrites state.json every poll, so a stale file means the job
+    is gone. Scheduler removal and eviction both leave the last state behind, which
+    is why liveness is decided from the timestamp and not from the file existing."""
+    return bool(state) and (time.time() - state.get("now_epoch", 0)) < 120
+
+
+def next_seq(d):
+    seqs = [int(p.stem) for p in list((d / "inbox").glob("*.json")) + list((d / "done").glob("*.json"))
+            if p.stem.isdigit()]
+    return max(seqs, default=0) + 1
+
+
+def send(d, payload):
+    seq = next_seq(d)
+    payload["seq"] = seq
+    payload["issued"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    payload["issued_by"] = os.environ.get("USER", "?")
+    name = f"{seq:06d}.json"
+    tmp = d / "inbox" / (name + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=1))
+    tmp.rename(d / "inbox" / name)      # rename is atomic: the supervisor never sees a partial file
+    return seq
+
+
+def wait_ack(d, seq, timeout=90):
+    done = d / "done" / f"{seq:06d}.json"
+    end = time.time() + timeout
+    while time.time() < end:
+        if done.exists():
+            return read_json(done, {}).get("result", {})
+        time.sleep(2)
+    return None
+
+
+def signal(d, name):
+    (d / "ctl").mkdir(parents=True, exist_ok=True)
+    (d / "ctl" / name).write_text(time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+
+
+def cmd_list(a):
+    root = need_root()
+    if not root.is_dir():
+        sys.exit(f"no control root at {root}")
+    rows = [(d.name, read_json(d / "state.json")) for d in sorted(root.iterdir()) if d.is_dir()]
+    if not rows:
+        sys.exit("no slots")
+    print(f"{'slot':<14}{'live':<6}{'sched':<8}{'state':<15}{'task':<20}{'left':<10}{'idle':<9}host")
+    for name, st in rows:
+        st = st or {}
+        task = st.get("task_label") or "-"
+        print(f"{name:<14}{'yes' if alive(st) else 'NO':<6}{st.get('scheduler','?'):<8}"
+              f"{st.get('state','?'):<15}{task:<20}{fmt_dur(st.get('remaining_s')):<10}"
+              f"{fmt_dur(st.get('idle_s')):<9}{st.get('host','?')}")
+
+
+def cmd_status(a):
+    d = slot_dir(a.slot)
+    st = read_json(d / "state.json", {})
+    print(f"slot       {a.slot}")
+    print(f"scheduler  {st.get('scheduler','?')}  job {st.get('job_id','?')}")
+    print(f"host       {st.get('host','?')}")
+    print(f"live       {'yes' if alive(st) else 'NO (stale heartbeat -- job likely gone)'}")
+    print(f"state      {st.get('state','?')}")
+    print(f"uptime     {fmt_dur(st.get('uptime_s'))} of {fmt_dur(st.get('max_lifetime_s'))}")
+    print(f"remaining  {fmt_dur(st.get('remaining_s'))}")
+    print(f"idle       {fmt_dur(st.get('idle_s'))} (cap {fmt_dur(st.get('max_idle_s'))})")
+    if st.get("task_running"):
+        print(f"task       seq {st.get('task_seq')} '{st.get('task_label')}' "
+              f"up {fmt_dur(st.get('task_uptime_s'))}")
+    else:
+        print("task       none")
+    print(f"gpu        {st.get('gpu_holders','?')} holder(s)"
+          f"{'  *** DIRTY: further tasks refused' if st.get('gpu_dirty') else ''}")
+    pend = sorted((d / "inbox").glob("*.json"))
+    if pend:
+        print(f"queued     {', '.join(p.stem for p in pend)}")
+
+
+def cmd_run(a):
+    d = ROOT / a.slot
+    env = {}
+    for kv in a.env or []:
+        if "=" not in kv:
+            sys.exit(f"--env expects KEY=VALUE, got {kv!r}")
+        k, v = kv.split("=", 1)
+        env[k] = v
+    payload = {"op": "run", "script": a.script, "args": a.args,
+               "label": a.label or pathlib.Path(a.script).stem,
+               "port": a.port or "", "env": env}
+    if a.queue:
+        for sub in ("inbox", "done", "tasks", "ctl"):
+            (d / sub).mkdir(parents=True, exist_ok=True)
+        seq = send(d, payload)
+        print(f"pre-queued {seq:06d} for '{a.slot}': {a.script} {' '.join(map(shlex.quote, a.args))}")
+        print("the supervisor runs it on its first poll after starting")
+        return
+    d = slot_dir(a.slot)
+    st = read_json(d / "state.json", {})
+    if not alive(st):
+        sys.exit(f"slot {a.slot} is not live. Submit one first, or pre-queue with --queue.")
+    if st.get("gpu_dirty"):
+        sys.exit(f"slot {a.slot} has dirty GPUs; the supervisor will refuse. Investigate or abort it.")
+    if st.get("task_running"):
+        print(f"note: this REPLACES running task '{st.get('task_label')}' "
+              f"(up {fmt_dur(st.get('task_uptime_s'))})", file=sys.stderr)
+    seq = send(d, payload)
+    print(f"queued {seq:06d}: run {a.script} {' '.join(map(shlex.quote, a.args))}")
+    if a.no_wait:
+        return
+    res = wait_ack(d, seq)
+    if res is None:
+        sys.exit("no acknowledgement within 90s -- check `slotctl status`")
+    print(f"supervisor: {res.get('status')} ({res.get('note','')})")
+    if res.get("status") not in ("started", "ok"):
+        sys.exit(1)
+
+
+def _queued(a, op, note):
+    d = slot_dir(a.slot)
+    seq = send(d, {"op": op})
+    print(f"queued {seq:06d}: {op}")
+    res = wait_ack(d, seq)
+    print(f"supervisor: {res.get('status')} ({res.get('note','')}) -- {note}" if res
+          else "no acknowledgement within 90s -- check `slotctl status`")
+
+
+def cmd_idle(a):  _queued(a, "idle", "slot held, no task running")
+def cmd_stop(a):  _queued(a, "stop", "allocation RELEASED; reacquiring it is not guaranteed")
+def cmd_drain(a): _queued(a, "drain", "will release once the current task finishes")
+
+
+def cmd_abort(a):
+    d = slot_dir(a.slot)
+    signal(d, "abort")
+    print(f"abort signalled for {a.slot} -- it skips the command queue and releases now")
+
+
+def cmd_log(a):
+    d = slot_dir(a.slot)
+    st = read_json(d / "state.json", {})
+    seq = st.get("task_seq")
+    log = (d / "tasks" / str(seq) / "task.log") if seq else None
+    if not log or not log.exists():
+        tasks = sorted((d / "tasks").glob("*/"), key=lambda p: p.name)
+        if not tasks:
+            sys.exit("no tasks yet")
+        log = tasks[-1] / "task.log"
+    if not log.exists():
+        sys.exit(f"no log at {log}")
+    subprocess.run(["tail", "-n", str(a.n)] + (["-f"] if a.follow else []) + [str(log)])
+
+
+def cmd_slog(a):
+    d = slot_dir(a.slot)
+    p = d / "supervisor.log"
+    if not p.exists():
+        sys.exit(f"no supervisor log at {p}")
+    subprocess.run(["tail", "-n", str(a.n)] + (["-f"] if a.follow else []) + [str(p)])
+
+
+def cmd_queue(a):
+    d = slot_dir(a.slot)
+    pend = sorted((d / "inbox").glob("*.json"))
+    if not pend:
+        print("queue empty")
+        return
+    for p in pend:
+        c = read_json(p, {})
+        print(f"{p.stem}  {c.get('op','?'):<7} {c.get('label',''):<18} {c.get('script','')}")
+
+
+def cmd_history(a):
+    d = slot_dir(a.slot)
+    for p in sorted((d / "done").glob("*.json")):
+        c = read_json(p, {}); r = c.get("result", {})
+        ex = (d / "tasks" / p.stem / "exit")
+        print(f"{p.stem}  {c.get('op','?'):<7} {c.get('label',''):<18} "
+              f"{r.get('status','?'):<9} {ex.read_text().strip() if ex.exists() else ''}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="slotctl", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list", help="every slot, with state and time remaining").set_defaults(fn=cmd_list)
+
+    for name, fn, h in (("status", cmd_status, "one slot in detail"),
+                        ("queue", cmd_queue, "pending commands"),
+                        ("history", cmd_history, "commands already handled"),
+                        ("idle", cmd_idle, "stop the task, keep the slot"),
+                        ("cancel", cmd_idle, "alias for idle"),
+                        ("drain", cmd_drain, "release once the current task finishes"),
+                        ("stop", cmd_stop, "stop the task and release the slot"),
+                        ("abort", cmd_abort, "release immediately, skipping the queue")):
+        p = sub.add_parser(name, help=h); p.add_argument("slot"); p.set_defaults(fn=fn)
+
+    for name, h in (("run", "run a script, replacing any current task"),
+                    ("swap", "alias for run; reads as intent when replacing work")):
+        p = sub.add_parser(name, help=h)
+        p.add_argument("slot"); p.add_argument("script"); p.add_argument("args", nargs="*")
+        p.add_argument("--label"); p.add_argument("--port",
+                       help="passed through; use a unique value per task if the payload needs one")
+        p.add_argument("--env", action="append", metavar="K=V")
+        p.add_argument("--no-wait", action="store_true")
+        p.add_argument("--queue", action="store_true",
+                       help="pre-queue for a slot that is not up yet")
+        p.set_defaults(fn=cmd_run)
+
+    for name, fn in (("log", cmd_log), ("slog", cmd_slog)):
+        p = sub.add_parser(name, help="tail the task log" if name == "log" else "tail the supervisor log")
+        p.add_argument("slot"); p.add_argument("-n", type=int, default=40)
+        p.add_argument("-f", "--follow", action="store_true"); p.set_defaults(fn=fn)
+
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

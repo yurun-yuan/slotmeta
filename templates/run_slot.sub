@@ -1,0 +1,36 @@
+# slotmeta -- HTCondor slot. Submit this instead of a run-specific .sub whenever you
+# expect to swap workloads: the allocation is held and `slotctl run` changes what
+# executes inside it, which costs seconds instead of a requeue.
+#
+#   condor_submit run_slot.sub
+#   SLOT_ROOT=/staging/$USER/slots slotctl run slotA scripts/train.sh cfg 6435
+#
+# arguments: <slot-name> <max-lifetime-seconds>   (the supervisor clamps to 24h)
+executable = slot_supervisor.sh
+arguments  = slotA 43200
+
+# SLOT_ROOT must be visible from BOTH the access point and the execute node.
+# SLOT_SNAPSHOT_EXTRA freezes files the task sources, alongside its script.
+environment = "SLOT_ROOT=/staging/$ENV(USER)/slots SLOT_REPO=/staging/$ENV(USER)/repo SLOT_SNAPSHOT_EXTRA=/staging/$ENV(USER)/repo/scripts/node_env.sh"
+
+log    = logs/slot_$(Cluster).log
+error  = logs/slot_$(Cluster).err
+output = logs/slot_$(Cluster).out
+stream_output = True
+stream_error  = True
+
+should_transfer_files   = YES
+when_to_transfer_output = NEVER
+transfer_input_files    = slot_supervisor.sh, common.sh, adapters
+
+# Size this like the workload it will host.
+request_cpus   = 32
+request_memory = 200GB
+request_disk   = 64GB
+request_gpus   = 4
+gpus_minimum_capability = 8.0
+gpus_minimum_memory     = 80000M
+requirements  = (Target.HasCHTCStaging == True)
++is_resumable = true
+
+queue 1

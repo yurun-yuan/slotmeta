@@ -1,0 +1,5 @@
+# Slots are runtime state, never source.
+slots/
+logs/
+*.pyc
+__pycache__/
