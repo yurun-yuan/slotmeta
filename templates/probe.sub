@@ -1,0 +1,35 @@
+# Live smoke test of slotmeta on a real execute node.
+#
+# Deliberately LIGHTWEIGHT -- 1 GPU, not 4 -- for two reasons: it schedules in
+# minutes instead of hours, and it must not compete with the klrneg slot agent for
+# the one 4-GPU slot this project can reach.
+#
+# 40 min lifetime, 10 min idle cap: long enough to exercise a swap and a teardown,
+# short enough that a forgotten probe releases the GPU on its own.
+executable = slot_supervisor.sh
+arguments  = probe 2400
+
+environment = "SLOT_ROOT=/staging/$ENV(USER)/slots SLOT_REPO=/staging/$ENV(USER)/slotmeta SLOT_MAX_IDLE=600 SLOT_MIN_TASK_TIME=60 SLOT_POLL=10 SLOT_KILL_GRACE=20 SLOT_SCHEDULER=condor"
+
+log    = logs/probe_$(Cluster).log
+error  = logs/probe_$(Cluster).err
+output = logs/probe_$(Cluster).out
+stream_output = True
+stream_error  = True
+
+should_transfer_files   = YES
+when_to_transfer_output = NEVER
+# CHTC refuses transfer_input_files from /staging ("use the osdf:/// or file:///
+# plugin"), so the supervisor and its adapters ship from HOME. Task scripts still
+# live on /staging and are read directly at runtime, which /staging does allow --
+# that is the whole point of SLOT_REPO.
+transfer_input_files    = common.sh, adapters
+
+request_cpus   = 4
+request_memory = 16GB
+request_disk   = 20GB
+request_gpus   = 1
+requirements  = (Target.HasCHTCStaging == True)
++is_resumable = true
+
+queue 1

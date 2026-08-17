@@ -184,8 +184,33 @@ isolation against a mid-run edit, hot swap, teardown of a process that escaped i
 process group the way `raylet` does, the `MIN_TASK_TIME` refusal, `stop`, the 24 h
 clamp, the idle release, and pre-queueing.
 
-What the suite *cannot* cover is a real Ray cluster teardown; that is exercised by the
-escaping-grandchild case, which reproduces the mechanism but not the scale.
+What the suite cannot cover is a real Ray cluster at scale; the escaping-grandchild case
+reproduces the mechanism but not the process count.
+
+### Live smoke test
+
+`probe/probe.sh` plus a small submit file exercises the whole thing on a real execute
+node without needing the workload. Ask for **one** GPU, not the big allocation, so it
+schedules in minutes and competes with nothing.
+
+Measured on CHTC (`jcaicedogpu0003`, L40S, 2026-08-16):
+
+```
+20:55:54  slot up: scheduler=condor job=6040451
+          identifying our processes by _CONDOR_SCRATCH_DIR=/var/lib/condor/.../scratch
+20:55:55  starting task 000001 (smoke)        <- pre-queued; ran with no further input
+20:56:36  tearing down task 000001 reason=swap
+20:56:39    sweep pass 1: 1 straggler(s): 983936   <- the process that escaped the group
+20:56:43    sweep converged after 1 pass(es)
+20:56:43    GPUs clear
+20:56:43  starting task 000002 (second)
+20:57:48  task 000003 exited rc=7 after 11s    <- natural exit, real code captured
+```
+
+**A swap took 7 seconds.** The probe deliberately spawns a `setsid` grandchild whose
+parent exits, so it is reparented to init with its own pgid — the process-group kill
+provably cannot reach it, and the tagged sweep is what caught it. On this run the
+escapee's pgid was 983936 against the task's 983925.
 
 ## Status
 

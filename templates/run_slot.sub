@@ -21,6 +21,10 @@ stream_error  = True
 
 should_transfer_files   = YES
 when_to_transfer_output = NEVER
+# CHTC REFUSES transfer_input_files from /staging or /projects ("use the osdf:///
+# or file:/// plugin"), so the supervisor and its adapters must ship from HOME.
+# Task scripts are different: they are read directly from /staging at runtime, which
+# is allowed and is the whole point of SLOT_REPO.
 transfer_input_files    = slot_supervisor.sh, common.sh, adapters
 
 # Size this like the workload it will host.
